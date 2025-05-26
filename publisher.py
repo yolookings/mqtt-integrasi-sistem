@@ -2,6 +2,9 @@ import paho.mqtt.client as mqtt
 import time
 import ssl # Diperlukan untuk TLS
 import random # Untuk Client ID unik
+import json
+from queue import Queue
+from threading import Lock
 
 # --- Konfigurasi ---
 BROKER_HOST = "public.cloud.shiftr.io"
@@ -23,12 +26,30 @@ TOPIC_QOS2 = f"{YOUR_UNIQUE_TOPIC_PREFIX}/iot/data/qos2"
 TOPIC_RETAINED = f"{YOUR_UNIQUE_TOPIC_PREFIX}/iot/status/retained"
 LAST_WILL_TOPIC = f"{YOUR_UNIQUE_TOPIC_PREFIX}/iot/client/{CLIENT_ID}/status" # LWT bisa spesifik per client
 LAST_WILL_MESSAGE = f"Client {CLIENT_ID} disconnected unexpectedly!"
-# --- Akhir Konfigurasi ---
+
+# Topik untuk request-response
+REQUEST_TOPIC = f"{YOUR_UNIQUE_TOPIC_PREFIX}/request"
+RESPONSE_TOPIC = f"{YOUR_UNIQUE_TOPIC_PREFIX}/response/{CLIENT_ID}"
+
+# Konfigurasi Flow Control
+MAX_QUEUE_SIZE = 1000  # Maksimum pesan dalam antrian
+RATE_LIMIT = 100  # Maksimum pesan per detik
+last_publish_time = 0
+publish_lock = Lock()
+
+# Queue untuk menyimpan pesan yang akan dikirim
+message_queue = Queue(maxsize=MAX_QUEUE_SIZE)
+
+# Dictionary untuk menyimpan request yang menunggu response
+pending_requests = {}
+request_lock = Lock()
 
 # Callback ketika koneksi ke broker berhasil
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print(f"Publisher ({CLIENT_ID}): Terhubung ke broker MQTT ({BROKER_HOST}) dengan kode hasil: {rc}")
+        # Subscribe ke topik response
+        client.subscribe(RESPONSE_TOPIC, qos=1)
     else:
         print(f"Publisher ({CLIENT_ID}): Gagal terhubung, kode hasil: {rc}")
         if rc == 5: print("   -> Kode 5 sering berarti Bad Username/Password atau Client ID sudah digunakan.")
@@ -45,6 +66,81 @@ def on_publish(client, userdata, mid):
 # Callback untuk logging (opsional, berguna untuk debugging)
 def on_log(client, userdata, level, buf):
     print(f"Publisher Log ({CLIENT_ID}): {buf}")
+
+def on_message(client, userdata, msg):
+    """Callback untuk menerima response"""
+    if msg.topic == RESPONSE_TOPIC:
+        try:
+            response_data = json.loads(msg.payload.decode())
+            request_id = response_data.get('request_id')
+            with request_lock:
+                if request_id in pending_requests:
+                    pending_requests[request_id]['response'] = response_data
+                    pending_requests[request_id]['event'].set()
+        except Exception as e:
+            print(f"Error processing response: {e}")
+
+def send_message_with_flow_control(topic, payload, qos=0, retain=False, expiry=None):
+    """Fungsi untuk mengirim pesan dengan flow control"""
+    global last_publish_time
+    
+    with publish_lock:
+        current_time = time.time()
+        if current_time - last_publish_time < 1.0/RATE_LIMIT:
+            time.sleep(1.0/RATE_LIMIT - (current_time - last_publish_time))
+        
+        try:
+            # Tambahkan expiry jika disediakan
+            if expiry:
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                payload['expiry'] = time.time() + expiry
+                payload = json.dumps(payload)
+            
+            result = publisher_client.publish(topic, payload, qos=qos, retain=retain)
+            last_publish_time = time.time()
+            return result
+        except Exception as e:
+            print(f"Error sending message: {e}")
+            return None
+
+def send_request(request_data, timeout=10):
+    """Fungsi untuk mengirim request dan menunggu response"""
+    request_id = str(random.randint(1000, 9999))
+    request_data['request_id'] = request_id
+    
+    # Buat event untuk menunggu response
+    import threading
+    event = threading.Event()
+    
+    with request_lock:
+        pending_requests[request_id] = {
+            'event': event,
+            'response': None
+        }
+    
+    # Kirim request
+    result = send_message_with_flow_control(
+        REQUEST_TOPIC,
+        json.dumps(request_data),
+        qos=1
+    )
+    
+    if not result:
+        with request_lock:
+            del pending_requests[request_id]
+        return None
+    
+    # Tunggu response
+    if event.wait(timeout):
+        with request_lock:
+            response = pending_requests[request_id]['response']
+            del pending_requests[request_id]
+            return response
+    else:
+        with request_lock:
+            del pending_requests[request_id]
+        return None
 
 # Inisialisasi MQTT Client
 # clean_session=False untuk shiftr.io jika ingin sesi persisten (hati-hati dengan LWT)
@@ -80,6 +176,7 @@ publisher_client.will_set(
 # --- Menghubungkan Callbacks ---
 publisher_client.on_connect = on_connect
 publisher_client.on_publish = on_publish
+publisher_client.on_message = on_message
 # publisher_client.on_log = on_log # Uncomment untuk debugging detail
 
 # --- Koneksi ke Broker ---
@@ -126,6 +223,29 @@ try:
 
     print(f"\nPublisher ({CLIENT_ID}): Semua pesan telah dikirim. Menunggu beberapa detik sebelum disconnect...")
     time.sleep(5)
+
+    # Contoh penggunaan request-response
+    request_data = {
+        'action': 'get_status',
+        'device_id': 'device123'
+    }
+    response = send_request(request_data)
+    if response:
+        print(f"Response received: {response}")
+    else:
+        print("No response received within timeout")
+    
+    # Contoh penggunaan expiry
+    payload_with_expiry = {
+        'message': 'This message will expire in 60 seconds',
+        'timestamp': time.time()
+    }
+    send_message_with_flow_control(
+        TOPIC_QOS1,
+        json.dumps(payload_with_expiry),
+        qos=1,
+        expiry=60  # Expire dalam 60 detik
+    )
 
 except Exception as e:
     print(f"Publisher ({CLIENT_ID}): Error saat publish - {e}")

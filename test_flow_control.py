@@ -1,59 +1,84 @@
 import time
 import json
-from publisher import send_message_with_flow_control, TOPIC_QOS1
+from publisher import send_message_with_flow_control, TOPIC_QOS1, publisher_client, BROKER_HOST, BROKER_PORT
+from threading import Thread
+import paho.mqtt.client as mqtt
 
 def test_flow_control():
     print("\n=== Testing Flow Control ===")
     
-    # Test 1: Rate limiting
-    print("\nTest 1: Mengirim 150 pesan (melebihi rate limit 100 pesan/detik)")
+    # Ensure publisher is connected
+    if not publisher_client.is_connected():
+        print("Publisher not connected, attempting to connect...")
+        publisher_client.connect(BROKER_HOST, BROKER_PORT, keepalive=60)
+        publisher_client.loop_start()
+        time.sleep(2)
+        if not publisher_client.is_connected():
+            print("Failed to connect publisher")
+            return
+    
+    # Test 1: Sending 10 messages
+    print("\nTest 1: Sending 10 messages (within rate limit)")
     start_time = time.time()
-    for i in range(150):
+    for i in range(10):
         payload = {
-            'message': f'Test rate limiting {i}',
+            'message': f'Flow control test message {i}',
             'timestamp': time.time()
         }
-        send_message_with_flow_control(
-            TOPIC_QOS1,
-            json.dumps(payload),
-            qos=1
-        )
-    end_time = time.time()
-    print(f"Waktu yang dibutuhkan: {end_time - start_time:.2f} detik")
-    print(f"Rate aktual: {150/(end_time - start_time):.2f} pesan/detik")
+        result = send_message_with_flow_control(TOPIC_QOS1, payload, qos=1)
+        if result and result.rc == mqtt.MQTT_ERR_SUCCESS:
+            print(f"Message {i} sent successfully")
+        else:
+            print(f"Failed to send message {i}, result: {result.rc if result else 'None'}")
+    elapsed_time = time.time() - start_time
+    rate = 10 / elapsed_time
+    print(f"Time taken: {elapsed_time:.2f} seconds")
+    print(f"Actual rate: {rate:.2f} messages/second")
     
-    # Test 2: Queue overflow
-    print("\nTest 2: Mengirim pesan dengan interval sangat pendek")
+    # Test 2: Sending messages with very short interval
+    print("\nTest 2: Sending messages with very short interval")
+    start_time = time.time()
     for i in range(5):
         payload = {
-            'message': f'Test queue overflow {i}',
+            'message': f'Short interval test message {i}',
             'timestamp': time.time()
         }
-        send_message_with_flow_control(
-            TOPIC_QOS1,
-            json.dumps(payload),
-            qos=1
-        )
-        time.sleep(0.001)  # Interval sangat pendek
+        result = send_message_with_flow_control(TOPIC_QOS1, payload, qos=1)
+        if result and result.rc == mqtt.MQTT_ERR_SUCCESS:
+            print(f"Message {i} sent successfully")
+        else:
+            print(f"Failed to send message {i}, result: {result.rc if result else 'None'}")
+        time.sleep(0.01)
+    elapsed_time = time.time() - start_time
+    rate = 5 / elapsed_time
+    print(f"Time taken: {elapsed_time:.2f} seconds")
+    print(f"Actual rate: {rate:.2f} messages/second")
     
-    # Test 3: Concurrent messages
-    print("\nTest 3: Mengirim pesan concurrent")
-    payloads = [
-        {'message': f'Concurrent message {i}', 'timestamp': time.time()}
-        for i in range(10)
-    ]
+    # Test 3: Sending concurrent messages
+    print("\nTest 3: Sending concurrent messages")
+    def send_concurrent_message(index):
+        payload = {
+            'message': f'Concurrent test message {index}',
+            'timestamp': time.time()
+        }
+        result = send_message_with_flow_control(TOPIC_QOS1, payload, qos=1)
+        if result and result.rc == mqtt.MQTT_ERR_SUCCESS:
+            print(f"Concurrent message {index} sent successfully")
+        else:
+            print(f"Failed to send concurrent message {index}, result: {result.rc if result else 'None'}")
     
     start_time = time.time()
-    for payload in payloads:
-        send_message_with_flow_control(
-            TOPIC_QOS1,
-            json.dumps(payload),
-            qos=1
-        )
-    end_time = time.time()
-    
-    print(f"Waktu pengiriman 10 pesan concurrent: {end_time - start_time:.2f} detik")
-    print(f"Rate aktual: {10/(end_time - start_time):.2f} pesan/detik")
+    threads = []
+    for i in range(5):
+        thread = Thread(target=send_concurrent_message, args=(i,))
+        threads.append(thread)
+        thread.start()
+    for thread in threads:
+        thread.join()
+    elapsed_time = time.time() - start_time
+    rate = 5 / elapsed_time
+    print(f"Time to send 5 concurrent messages: {elapsed_time:.2f} seconds")
+    print(f"Actual rate: {rate:.2f} messages/second")
 
 if __name__ == "__main__":
-    test_flow_control() 
+    test_flow_control()
